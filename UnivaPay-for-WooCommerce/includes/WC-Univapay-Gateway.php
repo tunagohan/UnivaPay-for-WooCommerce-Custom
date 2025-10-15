@@ -437,7 +437,12 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
 
         // ログ
         if (function_exists('wc_get_logger')) {
-            wc_get_logger()->info('UPFW webhook hit', ['source'=>'upfw', 'event'=>$event, 'status'=>$status, 'cid'=>$cid]);
+            wc_get_logger()->info('UPFW webhook hit', [
+                'source' => 'upfw',
+                'event'  => $event,
+                'status' => $status,
+                'cid'    => $cid,
+            ]);
         }
 
         if (!$cid) {
@@ -448,27 +453,52 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
         $orders = wc_get_orders([
             'limit'      => 1,
             'return'     => 'objects',
-            'meta_key'   => 'univapay_charge_id',
-            'meta_value' => $cid,
+            'orderby'    => 'date',
+            'order'      => 'DESC',
+            'meta_query' => [
+                'relation' => 'OR',
+                [
+                    'key'     => 'univapay_charge_id',
+                    'value'   => $cid,
+                    'compare' => '=',
+                ],
+                [
+                    'key'     => '_upfw_charge_id',
+                    'value'   => $cid,
+                    'compare' => '=',
+                ],
+            ],
         ]);
+
         if (!$orders) {
-            $orders = wc_get_orders([
-                'limit'      => 1,
-                'return'     => 'objects',
-                'meta_key'   => '_upfw_charge_id',
-                'meta_value' => $cid,
-            ]);
+            // HPOS/キャッシュ環境の保険として直接検索
+            global $wpdb;
+            $order_id = $wpdb->get_var($wpdb->prepare(
+                "SELECT post_id FROM {$wpdb->postmeta}
+                WHERE meta_key IN ('univapay_charge_id','_upfw_charge_id')
+                AND meta_value = %s
+                ORDER BY post_id DESC LIMIT 1",
+                $cid
+            ));
+            if ($order_id) {
+                $orders = [ wc_get_order((int)$order_id) ];
+            }
         }
 
-        if (!$orders) {
+        if (!$orders || !$orders[0]) {
             if (function_exists('wc_get_logger')) {
-                wc_get_logger()->warning('UPFW webhook: order not found for charge', ['source'=>'upfw', 'cid'=>$cid, 'event'=>$event, 'status'=>$status]);
+                wc_get_logger()->warning('UPFW webhook: order not found for charge', [
+                    'source' => 'upfw',
+                    'cid'    => $cid,
+                    'event'  => $event,
+                    'status' => $status,
+                ]);
             }
-
             status_header(204);
             exit;
         }
 
+        /** @var WC_Order $order */
         $order = $orders[0];
 
         if (in_array($order->get_status(), ['processing','completed','on-hold'], true)) {
@@ -503,5 +533,6 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
         echo 'OK';
         exit;
     }
+
 
 }
