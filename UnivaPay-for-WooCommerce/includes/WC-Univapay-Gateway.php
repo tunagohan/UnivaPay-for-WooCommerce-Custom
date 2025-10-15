@@ -313,13 +313,22 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
      */
     public function is_charge_valid($charge, $order)
     {
-        if ($charge->error) {
+        if (!empty($charge->error)) {
             return false;
         }
 
-        // prevent pending / awaiting charge
-        if (!in_array($charge->status, [ChargeStatus::SUCCESSFUL(), ChargeStatus::AUTHORIZED()])) {
-            error_log('Invalid order ID: ' . $order->get_id() . ' with charge status: ' . $charge->status->getValue());
+        // SDKのEnumはequalsが無いので、getValue()で文字列比較に寄せる
+        $status_val = is_object($charge->status) && method_exists($charge->status, 'getValue')
+            ? $charge->status->getValue()
+            : (string) $charge->status;
+
+        $ok_statuses = [
+            \Univapay\Enums\ChargeStatus::SUCCESSFUL()->getValue(),
+            \Univapay\Enums\ChargeStatus::AUTHORIZED()->getValue(),
+        ];
+
+        if (!in_array($status_val, $ok_statuses, true)) {
+            error_log('Invalid order ID: ' . $order->get_id() . ' with charge status: ' . $status_val);
             return false;
         }
 
@@ -355,27 +364,34 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
             }
             $charge = $this->univapay_client->getCharge($token->storeId, $_GET['univapayChargeId']);
 
-            if (!$this->is_charge_valid($charge, $order)) {
-                // NOTE: notice does not show up on block checkout page
+            // まずは共通バリデーション（内部で getValue 比較）
+            if ( ! $this->is_charge_valid($charge, $order) ) {
                 wc_add_notice(__('決済エラー入力内容を確認してください', 'upfw'), 'error');
                 wp_safe_redirect(wc_get_cart_url());
                 exit;
             }
-            // TODO: add validation so order status does not get overwritten, when page is refreshed
 
-            $capture = $this->capture === 'yes';
-            $paymentType = $this->univapay_client->getTransactionToken($charge->transactionTokenId)->paymentType->getValue();
-            global $woocommerce;
-            if ($capture || !in_array($paymentType, ['card', 'paidy'])) {
+            // 支払い種別を確認
+            $paymentTypeObj = $this->univapay_client->getTransactionToken($charge->transactionTokenId)->paymentType;
+            if (is_object($paymentTypeObj) && is_callable([$paymentTypeObj, 'getValue'])) {
+                $paymentType = (string) $paymentTypeObj->getValue();
+            } else {
+                $paymentType = (string) $paymentTypeObj; // 文字列化（モック・想定外型でもOK）
+            }
+            $paymentType = strtolower(trim($paymentType));
+
+            // capture 設定
+            $capture = ($this->capture === 'yes');
+
+            if ($capture || !in_array($paymentType, ['card', 'paidy'], true)) {
                 $order->payment_complete();
-                // add comment for order can see admin panel
                 $order->add_order_note(__('UnivaPayでの支払が完了いたしました。', 'upfw'), true);
             } else {
                 $order->update_status($this->status, __('キャプチャ待ちです', 'upfw'));
-                // add comment for order can see admin panel
                 $order->add_order_note(__('UnivaPayでのオーソリが完了いたしました。', 'upfw'), true);
             }
-            // save charge id
+
+            // 課金IDの保存
             update_post_meta($order_id, 'univapay_charge_id', $charge->id);
         } catch (\Exception $e) {
             error_log(print_r($e, true));
@@ -384,10 +400,7 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
             exit;
         }
 
-        // Attempt to patch the charge with the order_id.
-        // Note: On legacy checkout inline form does not have an order_id by default.
-        // This is a best-effort request; if it fails, we do not catch or handle the error,
-        // as the order processing should continue regardless of this request's outcome.
+        // Charge へ Woo 側参照情報をパッチ（ベストエフォート）
         try {
             $payload = array(
                 'metadata' => array_merge(
@@ -401,7 +414,6 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
                 $charge->patch($payload);
             }
         } catch (\Throwable $e) {
-            // Do not break checkout flow because of a patch error.
             error_log('[UnivaPay] charge patch skipped: ' . $e->getMessage());
         }
     }
