@@ -116,6 +116,9 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
         add_action('wp_enqueue_scripts', array($this, 'payment_scripts'));
         add_action('template_redirect', array($this, 'process_redirect_payment'));
 
+        // ★ Webhook 受け口: https://{your-site}/?wc-api=upfw
+        add_action('woocommerce_api_upfw', array($this, 'webhook'));
+
         // Display charge id in order details
         // TODO: fix meta box later and see what we can do with this
         add_action('woocommerce_admin_order_data_after_order_details', function ($order) {
@@ -265,10 +268,7 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
 
         $money = new Money($order->get_data()["total"], new Currency($order->get_data()["currency"]));
 
-        // Note: Legacy checkout does not create a draft order by default.
-        // Reference: https://woocommerce.com/document/managing-orders/order-statuses/#draft-order-status
-        // Therefore, the redirect payment process should be handled at this stage to ensure order information is available.
-        // Handling this on the front end would require extensive work to match cart information and user session data.
+        // Optional redirect flow
         if (isset($_POST['univapay_optional']) && $_POST['univapay_optional'] === 'true') {
             return array(
                 'result' => 'success',
@@ -287,16 +287,21 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
             );
         }
 
+        // Univapay ウィジェットからの POST 値（JS が hidden を挿れる）
         if (!isset($_POST["univapayChargeId"]) && !isset($_POST["univapay_charge_id"])) {
             wc_add_notice(__('決済エラーサイト管理者にお問い合わせください。', 'upfw'), 'error');
             return;
         }
-        $chargeId = isset($_POST["univapayChargeId"]) ? $_POST["univapayChargeId"] : $_POST["univapay_charge_id"];
+        $chargeId = isset($_POST["univapayChargeId"]) ? wc_clean(wp_unslash($_POST["univapayChargeId"])) : wc_clean(wp_unslash($_POST["univapay_charge_id"]));
 
-        // Redirect to the thank you page
+        // ★ ここが今回のポイント：ThankYou 到達前にチャージIDを保存し、Webhook 突合の軸にする
+        update_post_meta($order_id, 'univapay_charge_id', $chargeId);
+        update_post_meta($order_id, '_upfw_charge_id', $chargeId); // 予備キー
+
+        // ThankYou へ
         return array(
-            'result' => 'success',
-            'redirect' => add_query_arg('univapayChargeId', $chargeId, $this->get_return_url($order))
+            'result'  => 'success',
+            'redirect'=> add_query_arg('univapayChargeId', $chargeId, $this->get_return_url($order))
         );
     }
 
@@ -383,7 +388,22 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
         // Note: On legacy checkout inline form does not have an order_id by default.
         // This is a best-effort request; if it fails, we do not catch or handle the error,
         // as the order processing should continue regardless of this request's outcome.
-        $charge->patch(['order_id' => $order->get_id()]);
+        try {
+            $payload = array(
+                'metadata' => array_merge(
+                    is_array($charge->metadata ?? null) ? $charge->metadata : array(),
+                    array('order_id' => (string) $order->get_id())
+                ),
+                'merchant_transaction_id' => (string) $order->get_order_key(),
+            );
+
+            if (is_object($charge) && method_exists($charge, 'patch')) {
+                $charge->patch($payload);
+            }
+        } catch (\Throwable $e) {
+            // Do not break checkout flow because of a patch error.
+            error_log('[UnivaPay] charge patch skipped: ' . $e->getMessage());
+        }
     }
 
     /*
@@ -391,5 +411,85 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
     */
     public function webhook()
     {
+        // 受信（JSON優先）
+        $raw = file_get_contents('php://input');
+        $payload = json_decode($raw, true);
+        if (!is_array($payload)) {
+            $payload = $_POST ? array_map('wc_clean', wp_unslash($_POST)) : [];
+        }
+
+        $event  = isset($payload['event']) ? (string)$payload['event'] : '';
+        $data   = isset($payload['data'])  ? (array)$payload['data']  : [];
+        $cid    = isset($data['id']) ? (string)$data['id'] : '';
+        $status = isset($data['status']) ? strtolower((string)$data['status']) : '';
+
+        // ログ
+        if (function_exists('wc_get_logger')) {
+            wc_get_logger()->info('UPFW webhook hit', ['source'=>'upfw', 'event'=>$event, 'status'=>$status, 'cid'=>$cid]);
+        }
+
+        if (!$cid) {
+            status_header(204);
+            exit;
+        }
+
+        $orders = wc_get_orders([
+            'limit'      => 1,
+            'return'     => 'objects',
+            'meta_key'   => 'univapay_charge_id',
+            'meta_value' => $cid,
+        ]);
+        if (!$orders) {
+            $orders = wc_get_orders([
+                'limit'      => 1,
+                'return'     => 'objects',
+                'meta_key'   => '_upfw_charge_id',
+                'meta_value' => $cid,
+            ]);
+        }
+
+        if (!$orders) {
+            if (function_exists('wc_get_logger')) {
+                wc_get_logger()->warning('UPFW webhook: order not found for charge', ['source'=>'upfw', 'cid'=>$cid, 'event'=>$event, 'status'=>$status]);
+            }
+
+            status_header(204);
+            exit;
+        }
+
+        $order = $orders[0];
+
+        if (in_array($order->get_status(), ['processing','completed','on-hold'], true)) {
+            status_header(204);
+            exit;
+        }
+
+        if ($event === 'charge_finished') {
+            if ($status === 'successful' || $status === 'authorized') {
+                $order->payment_complete($cid);
+                $order->add_order_note(__('UnivaPay決済が完了しました (webhook)。', 'upfw'), true);
+                $order->save();
+                status_header(200);
+                echo 'OK';
+                exit;
+            }
+
+            if (in_array($status, ['failed','canceled','cancelled','void'], true)) {
+                $order->update_status('failed', __('UnivaPay決済が失敗/取消 (webhook)。', 'upfw'), true);
+                $order->save();
+                status_header(200);
+                echo 'OK';
+                exit;
+            }
+
+            status_header(200);
+            echo 'OK';
+            exit;
+        }
+
+        status_header(200);
+        echo 'OK';
+        exit;
     }
+
 }
