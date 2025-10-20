@@ -5,7 +5,7 @@
  * Description: UnivaPayを使用して店舗でクレジットカード決済が可能です。
  * Author: UnivaPay + k.waragai
  * Author URI: https://univapay.com/service/
- * Version: 0.4.6-custom.1
+ * Version: 0.4.6-custom.2
  * Text Domain: upfw
  */
 
