@@ -86,54 +86,54 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
     */
     public function __construct()
     {
-        $this->id = 'upfw'; // payment gateway plugin ID
-        $this->icon = ''; // URL of the icon that will be displayed on checkout page near your gateway name
-        $this->has_fields = true; // in case you need a custom credit card form
+        $this->id = 'upfw';
+        $this->icon = '';
+        $this->has_fields = true;
         $this->method_title = 'Univapay Gateway';
-        $this->method_description = __('UnivaPayで様々な決済手段を提供します', 'upfw'); // will be displayed on the options page
-        // Method with all the options fields
+        $this->method_description = __('UnivaPayで様々な決済手段を提供します', 'upfw');
+
         $this->init_form_fields();
-        // Load the settings.
         $this->init_settings();
-        $this->title = $this->get_option('title');
+
+        $this->title   = $this->get_option('title');
         $this->description = $this->get_option('description');
         $this->enabled = $this->get_option('enabled');
-        $this->widget = $this->get_option('widget');
-        $this->api = $this->get_option('api');
-        $this->token = $this->get_option('token');
-        $this->secret = $this->get_option('secret');
+        $this->widget  = $this->get_option('widget');
+        $this->api     = $this->get_option('api');
+        $this->token   = $this->get_option('token');
+        $this->secret  = $this->get_option('secret');
         $this->capture = $this->get_option('capture');
-        $this->status = $this->get_option('status');
+        $this->status  = $this->get_option('status');
         $this->formurl = $this->get_option('formurl');
+
         $this->app_jwt = null;
         $this->univapay_client = null;
         $this->univapay_client_options = new UnivapayClientOptions($this->api);
 
-        // This action hook saves the settings
         add_action('woocommerce_update_options_payment_gateways_' . $this->id, array( $this, 'process_admin_options' ));
-
-        // TODO: only enqueue scripts on neccessary pages (e.g: checkout, myaccount-oders)
         add_action('wp_enqueue_scripts', array($this, 'payment_scripts'));
         add_action('template_redirect', array($this, 'process_redirect_payment'));
 
-        // ★ Webhook 受け口: https://{your-site}/?wc-api=upfw
+        // Webhook 受け口（?wc-api=upfw）
         add_action('woocommerce_api_upfw', array($this, 'webhook'));
 
-        // Display charge id in order details
-        // TODO: fix meta box later and see what we can do with this
+        // 内部リトライ用フック（Action Scheduler があればそれ経由、無くても wp-cron で動く）
+        add_action('upfw_retry_webhook', array($this, 'retry_webhook_handler'), 10, 1);
+
+        // 管理画面：課金ID表示
         add_action('woocommerce_admin_order_data_after_order_details', function ($order) {
             $order_id = method_exists($order, 'get_id') ? $order->get_id() : $order->id;
             $univapay_charge_id = get_post_meta($order_id, 'univapay_charge_id', true);
             if ($univapay_charge_id) {
                 echo '<div class="form-field form-field-wide">';
-                echo '<p><strong>' . __('課金ID') . ':</strong> ' . $univapay_charge_id . '</p>';
+                echo '<p><strong>' . __('課金ID') . ':</strong> ' . esc_html($univapay_charge_id) . '</p>';
                 echo '</div>';
             }
         });
     }
 
     /**
-    * Plugin options, we deal with it in Step 3 too
+    * Plugin options
     */
     public function init_form_fields()
     {
@@ -205,18 +205,14 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
         );
     }
 
-    // TODO: split pay for order and checkout page logic
     public function payment_scripts()
     {
-        // pay_for_order = my account order pay page
         if (! is_cart() && ! is_checkout() && ! isset($_GET['pay_for_order'])) {
             return;
         }
-        // if our payment gateway is disabled, we do not have to enqueue JS too
         if ('no' === $this->enabled) {
             return;
         }
-        // no reason to enqueue JavaScript if App token are not set
         if (empty($this->token)) {
             return;
         }
@@ -243,7 +239,6 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
                 'order_id' => $order->get_id(),
             ));
         } else {
-            // cart & checkout page
             wp_localize_script('univapay_woocommerce', 'univapay_params', array(
                 'app_id' => $this->token,
                 'formurl' => $this->formurl,
@@ -255,8 +250,6 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
 
     public function process_payment($order_id)
     {
-        // In legacy checkout, there is no built-in mechanism to validate the checkout form without processing the order.
-        // Reaching this point indicates that the form has been validated successfully.
         if (isset($_POST['validation_only'])) {
             return array(
                 'result' => 'success',
@@ -265,7 +258,6 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
 
         $order = wc_get_order($order_id);
         $capture = $this->capture === 'yes';
-
         $money = new Money($order->get_data()["total"], new Currency($order->get_data()["currency"]));
 
         // Optional redirect flow
@@ -277,7 +269,7 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
                     '&emailAddress=' . $order->get_data()["billing"]["email"] .
                     '&name=' . $order->get_data()["billing"]["first_name"] . ' ' . $order->get_data()["billing"]["last_name"] .
                     '&phoneNumber=' . $order->get_data()["billing"]["phone"] .
-                    '&auth=' . ($capture ? 'false' : 'true') . # auth: true = authorize, false = capture
+                    '&auth=' . ($capture ? 'false' : 'true') .
                     '&amount=' . $money->getAmount() .
                     '&currency=' . $money->getCurrency() .
                     '&order_id=' . $order_id .
@@ -287,18 +279,17 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
             );
         }
 
-        // Univapay ウィジェットからの POST 値（JS が hidden を挿れる）
+        // Univapay ウィジェットからの POST（hidden）
         if (!isset($_POST["univapayChargeId"]) && !isset($_POST["univapay_charge_id"])) {
             wc_add_notice(__('決済エラーサイト管理者にお問い合わせください。', 'upfw'), 'error');
             return;
         }
         $chargeId = isset($_POST["univapayChargeId"]) ? wc_clean(wp_unslash($_POST["univapayChargeId"])) : wc_clean(wp_unslash($_POST["univapay_charge_id"]));
 
-        // ★ ここが今回のポイント：ThankYou 到達前にチャージIDを保存し、Webhook 突合の軸にする
+        // ThankYou 到達前でも突合できるように一次保存
         update_post_meta($order_id, 'univapay_charge_id', $chargeId);
-        update_post_meta($order_id, '_upfw_charge_id', $chargeId); // 予備キー
+        update_post_meta($order_id, '_upfw_charge_id', $chargeId);
 
-        // ThankYou へ
         return array(
             'result'  => 'success',
             'redirect'=> add_query_arg('univapayChargeId', $chargeId, $this->get_return_url($order))
@@ -306,10 +297,7 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
     }
 
     /**
-     * Check if charge token is valid
-     * @param Charge $charge
-     * @param WC_Order $order
-     * @return bool
+     * Charge バリデーション（Enum equals無し → getValue()で比較）
      */
     public function is_charge_valid($charge, $order)
     {
@@ -317,14 +305,13 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
             return false;
         }
 
-        // SDKのEnumはequalsが無いので、getValue()で文字列比較に寄せる
         $status_val = is_object($charge->status) && method_exists($charge->status, 'getValue')
             ? $charge->status->getValue()
             : (string) $charge->status;
 
         $ok_statuses = [
-            \Univapay\Enums\ChargeStatus::SUCCESSFUL()->getValue(),
-            \Univapay\Enums\ChargeStatus::AUTHORIZED()->getValue(),
+            ChargeStatus::SUCCESSFUL()->getValue(),
+            ChargeStatus::AUTHORIZED()->getValue(),
         ];
 
         if (!in_array($status_val, $ok_statuses, true)) {
@@ -336,18 +323,15 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
     }
 
     /**
-     * Process redirect payment
-     * Validate charge and process order
+     * ThankYou での最終確定処理
      */
     public function process_redirect_payment()
     {
         if (getenv('WP_ENV') !== 'test') {
-            // Default environment
             if (! is_order_received_page() || empty($_GET['univapayChargeId'])) {
                 return;
             }
         } else {
-            // Test environment
             if (empty($_GET['univapayChargeId'])) {
                 return;
             }
@@ -356,31 +340,26 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
         try {
             global $wp;
             $order_id = absint($wp->query_vars['order-received']);
-
             $order = wc_get_order($order_id);
+
             $token = $this->app_jwt ? $this->app_jwt::createToken($this->token, $this->secret) : AppJWT::createToken($this->token, $this->secret);
             if ($this->univapay_client === null) {
                 $this->univapay_client = new UnivapayClient($token, $this->univapay_client_options);
             }
             $charge = $this->univapay_client->getCharge($token->storeId, $_GET['univapayChargeId']);
 
-            // まずは共通バリデーション（内部で getValue 比較）
             if ( ! $this->is_charge_valid($charge, $order) ) {
                 wc_add_notice(__('決済エラー入力内容を確認してください', 'upfw'), 'error');
                 wp_safe_redirect(wc_get_cart_url());
                 exit;
             }
 
-            // 支払い種別を確認
             $paymentTypeObj = $this->univapay_client->getTransactionToken($charge->transactionTokenId)->paymentType;
-            if (is_object($paymentTypeObj) && is_callable([$paymentTypeObj, 'getValue'])) {
-                $paymentType = (string) $paymentTypeObj->getValue();
-            } else {
-                $paymentType = (string) $paymentTypeObj; // 文字列化（モック・想定外型でもOK）
-            }
+            $paymentType = is_object($paymentTypeObj) && is_callable([$paymentTypeObj, 'getValue'])
+                ? (string) $paymentTypeObj->getValue()
+                : (string) $paymentTypeObj;
             $paymentType = strtolower(trim($paymentType));
 
-            // capture 設定
             $capture = ($this->capture === 'yes');
 
             if ($capture || !in_array($paymentType, ['card', 'paidy'], true)) {
@@ -391,7 +370,6 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
                 $order->add_order_note(__('UnivaPayでのオーソリが完了いたしました。', 'upfw'), true);
             }
 
-            // 課金IDの保存
             update_post_meta($order_id, 'univapay_charge_id', $charge->id);
         } catch (\Exception $e) {
             error_log(print_r($e, true));
@@ -400,7 +378,7 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
             exit;
         }
 
-        // Charge へ Woo 側参照情報をパッチ（ベストエフォート）
+        // Charge に Woo 側参照情報をベストエフォートでパッチ
         try {
             $payload = array(
                 'metadata' => array_merge(
@@ -418,12 +396,12 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
         }
     }
 
-    /*
-    * In case you need a webhook, like PayPal IPN etc
-    */
+    /**
+     * Webhook 受信
+     * - 見つからない場合は 200 を返し、内部で 30秒後→60秒後 の最大2回だけリトライ
+     */
     public function webhook()
     {
-        // 受信（JSON優先）
         $raw = file_get_contents('php://input');
         $payload = json_decode($raw, true);
         if (!is_array($payload)) {
@@ -435,7 +413,6 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
         $cid    = isset($data['id']) ? (string)$data['id'] : '';
         $status = isset($data['status']) ? strtolower((string)$data['status']) : '';
 
-        // ログ
         if (function_exists('wc_get_logger')) {
             wc_get_logger()->info('UPFW webhook hit', [
                 'source' => 'upfw',
@@ -450,6 +427,95 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
             exit;
         }
 
+        $order = $this->find_order_by_charge_id($cid);
+        if (!$order) {
+            if (function_exists('wc_get_logger')) {
+                wc_get_logger()->warning('UPFW webhook: order not found for charge (defer internal retry)', [
+                    'source'=>'upfw', 'cid'=>$cid, 'event'=>$event, 'status'=>$status
+                ]);
+            }
+            $this->store_pending_webhook($cid, $payload);
+            $this->schedule_retry($cid, 30); // 30秒後に1回目
+            status_header(200);
+            echo 'DEFERRED';
+            exit;
+        }
+
+        $this->apply_webhook_to_order($order, $event, $status, $cid);
+        status_header(200);
+        echo 'OK';
+        exit;
+    }
+
+    /* ====== 内部リトライ関連 ====== */
+
+    private function store_pending_webhook($cid, array $payload)
+    {
+        update_option('upfw_pending_'.$cid, wp_json_encode($payload), false);
+        update_option('upfw_retry_attempts_'.$cid, 0, false);
+    }
+
+    private function clear_pending_webhook($cid)
+    {
+        delete_option('upfw_pending_'.$cid);
+        delete_option('upfw_retry_attempts_'.$cid);
+    }
+
+    private function schedule_retry($cid, $delay)
+    {
+        if (function_exists('as_schedule_single_action')) {
+            as_schedule_single_action(time() + (int)$delay, 'upfw_retry_webhook', [$cid], 'upfw');
+        } else {
+            wp_schedule_single_event(time() + (int)$delay, 'upfw_retry_webhook', [$cid]);
+        }
+    }
+
+    /**
+     * 30秒後 → 60秒後 の最大2回のみ
+     */
+    public function retry_webhook_handler($cid)
+    {
+        $payload_json = get_option('upfw_pending_'.$cid);
+        if (!$payload_json) {
+            return;
+        }
+        $payload = json_decode($payload_json, true) ?: [];
+        $attempts = (int) get_option('upfw_retry_attempts_'.$cid, 0);
+
+        $event  = isset($payload['event']) ? (string)$payload['event'] : '';
+        $data   = isset($payload['data'])  ? (array)$payload['data']  : [];
+        $status = isset($data['status']) ? strtolower((string)$data['status']) : '';
+
+        $order = $this->find_order_by_charge_id($cid);
+        if ($order) {
+            $this->apply_webhook_to_order($order, $event, $status, $cid);
+            $this->clear_pending_webhook($cid);
+            if (function_exists('wc_get_logger')) {
+                wc_get_logger()->info('UPFW retry resolved', ['source'=>'upfw','cid'=>$cid,'attempts'=>$attempts]);
+            }
+            return;
+        }
+
+        if ($attempts === 0) {
+            update_option('upfw_retry_attempts_'.$cid, 1, false);
+            if (function_exists('wc_get_logger')) {
+                wc_get_logger()->warning('UPFW retry re-scheduled (final in 60s)', ['source'=>'upfw','cid'=>$cid]);
+            }
+            $this->schedule_retry($cid, 60);
+            return;
+        }
+
+        if (function_exists('wc_get_logger')) {
+            wc_get_logger()->error('UPFW retry gave up (order not found after 2 attempts)', ['source'=>'upfw','cid'=>$cid]);
+        }
+        $this->clear_pending_webhook($cid);
+    }
+
+    /**
+     * 課金IDから注文を探す（meta_query → 直接SQL の順）
+     */
+    private function find_order_by_charge_id($cid)
+    {
         $orders = wc_get_orders([
             'limit'      => 1,
             'return'     => 'objects',
@@ -469,70 +535,46 @@ class WC_Univapay_Gateway extends WC_Payment_Gateway
                 ],
             ],
         ]);
-
-        if (!$orders) {
-            // HPOS/キャッシュ環境の保険として直接検索
-            global $wpdb;
-            $order_id = $wpdb->get_var($wpdb->prepare(
-                "SELECT post_id FROM {$wpdb->postmeta}
-                WHERE meta_key IN ('univapay_charge_id','_upfw_charge_id')
-                AND meta_value = %s
-                ORDER BY post_id DESC LIMIT 1",
-                $cid
-            ));
-            if ($order_id) {
-                $orders = [ wc_get_order((int)$order_id) ];
-            }
+        if ($orders && $orders[0]) {
+            return $orders[0];
         }
 
-        if (!$orders || !$orders[0]) {
-            if (function_exists('wc_get_logger')) {
-                wc_get_logger()->warning('UPFW webhook: order not found for charge', [
-                    'source' => 'upfw',
-                    'cid'    => $cid,
-                    'event'  => $event,
-                    'status' => $status,
-                ]);
-            }
-            status_header(204);
-            exit;
+        global $wpdb;
+        $order_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT post_id FROM {$wpdb->postmeta}
+             WHERE meta_key IN ('univapay_charge_id','_upfw_charge_id')
+               AND meta_value = %s
+             ORDER BY post_id DESC LIMIT 1",
+            $cid
+        ));
+        if ($order_id) {
+            return wc_get_order((int)$order_id);
         }
+        return null;
+    }
 
-        /** @var WC_Order $order */
-        $order = $orders[0];
-
+    /**
+     * Webhookの内容を注文へ適用
+     */
+    private function apply_webhook_to_order($order, $event, $status, $cid)
+    {
         if (in_array($order->get_status(), ['processing','completed','on-hold'], true)) {
-            status_header(204);
-            exit;
+            return;
         }
 
         if ($event === 'charge_finished') {
             if ($status === 'successful' || $status === 'authorized') {
                 $order->payment_complete($cid);
-                $order->add_order_note(__('UnivaPay決済が完了しました (webhook)。', 'upfw'), true);
+                $order->add_order_note(__('UnivaPay決済が完了しました (自動案内)。', 'upfw'), true);
                 $order->save();
-                status_header(200);
-                echo 'OK';
-                exit;
+                return;
             }
 
             if (in_array($status, ['failed','canceled','cancelled','void'], true)) {
-                $order->update_status('failed', __('UnivaPay決済が失敗/取消 (webhook)。', 'upfw'), true);
+                $order->update_status('failed', __('UnivaPay決済が失敗/取消 (自動案内)。', 'upfw'), true);
                 $order->save();
-                status_header(200);
-                echo 'OK';
-                exit;
+                return;
             }
-
-            status_header(200);
-            echo 'OK';
-            exit;
         }
-
-        status_header(200);
-        echo 'OK';
-        exit;
     }
-
-
 }
