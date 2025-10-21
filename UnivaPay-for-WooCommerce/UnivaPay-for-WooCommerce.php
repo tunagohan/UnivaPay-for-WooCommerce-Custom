@@ -1,11 +1,12 @@
 <?php
 /*
- * Plugin Name: UnivaPay for WooCommerce
+ * Plugin Name: UnivaPay for WooCommerce Custom
  * Plugin URI: https://univapay.com
  * Description: UnivaPayを使用して店舗でクレジットカード決済が可能です。
- * Author: UnivaPay
+ * Author: UnivaPay + k.waragai
  * Author URI: https://univapay.com/service/
- * Version: 0.4.6
+ * Version: 0.4.6-custom.2
+ * Text Domain: upfw
  */
 
 if (is_readable(__DIR__ . '/vendor/autoload.php')) {
